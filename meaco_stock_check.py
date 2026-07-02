@@ -267,5 +267,52 @@ def main():
         print(f"[{status}] ({method}) {name} - {reason}")
         print(f"  {url}")
 
+        in_stock = status in ("IN_STOCK", "POSSIBLE_IN_STOCK")
+
+        if in_stock:
+            any_in_stock = True
+
+            # Count how many consecutive checks this product has been in stock.
+            record = seen.get(url) or {"count": 0}
+            record["count"] = record.get("count", 0) + 1
+            record["status"] = status
+            record["last_seen"] = now
+            seen[url] = record
+            count = record["count"]
+
+            # First time: several alerts. Next few checks: one each.
+            # After that: repeat every run.
+            if count == 1:
+                n_alerts = FIRST_TIME_ALERT_COUNT
+            elif count <= ALERT_EVERY_TIME_LIMIT:
+                n_alerts = 1
+            else:
+                n_alerts = REPEAT_ALERT_COUNT
+
+            title = "Meaco Cirro in stock!"
+            message = f"{name} is available. Buy now.\n{url}"
+            for _ in range(n_alerts):
+                send_alert(title, message, url)
+            open_in_browser(url)  # open the page once, not once per alert
+
+            print(f"  -> in stock for {count} check(s); sent {n_alerts} alert(s)")
+
+        elif status == "OUT_OF_STOCK":
+            # Went out of stock: clear its memory so a future restock alerts
+            # again from the very first check.
+            if url in seen:
+                del seen[url]
+                print("  -> was previously in stock; memory cleared")
+        # UNKNOWN status: leave memory untouched and don't alert.
+
+    print("-" * 70)
+    if not any_in_stock:
+        print("No in-stock Meaco Cirro air conditioners found.")
+
+    save_seen(seen)
+
+
+if __name__ == "__main__":
+    main()
  
 
