@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 
 """
-Stock checker for a single Meaco product:
+Stock checker for a single Meaco product, used to TEST the alerting logic:
     MeacoDry Arete One 6L  (Warm Pebble variant)
     https://www.meaco.com/products/meacodry-arete-one-6l?variant=56834319155587
+
+This is a copy of the air-conditioner checker (meaco_stock_check.py) with the
+SAME alerting logic, just pointed at the dehumidifier. Because that item is
+currently in stock, running this repeatedly is a good way to confirm the alert
+cadence works end to end:
+
+  - first time stock is found:            FIRST_TIME_ALERT_COUNT alerts (3)
+  - checks 2 up to ALERT_EVERY_TIME_LIMIT: one alert each
+  - after that:                            REPEAT_ALERT_COUNT alerts every run (2)
+  - if it ever goes out of stock, its memory is cleared so a later restock
+    starts the count again from zero.
 
 meaco.com runs on Shopify, so the most reliable way to check stock is the
 Shopify product JSON endpoint (the product URL with ".js" on the end). That
 returns each colour variant with an exact "available": true/false flag, which
 is far more trustworthy than scraping "out of stock" wording off the page.
 
-Sends a phone push via ntfy.sh when the variant comes back in stock.
+Sends a phone push via ntfy.sh when the watched item is in stock.
 """
 
 import json
@@ -28,23 +39,38 @@ from html import unescape
 
 # Phone push notifications via ntfy.sh.
 # Install the free "ntfy" app on your phone and subscribe to this exact topic.
+# (Can also be overridden with an NTFY_TOPIC environment variable.)
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "Barn3389")
 
-# The product to watch.
-PRODUCT_NAME = "MeacoDry Arete One 6L (Warm Pebble)"
-PRODUCT_HANDLE = "meacodry-arete-one-6l"
-PRODUCT_URL = f"https://www.meaco.com/products/{PRODUCT_HANDLE}"
+# The single product to watch (the dehumidifier we tested earlier).
+PRODUCTS = [
+    {
+        "name": "MeacoDry Arete One 6L - Warm Pebble",
+        "handle": "meacodry-arete-one-6l",
+        # The exact colour variant to watch (the "?variant=..." number in the
+        # URL). Set to None to treat the product as in stock if ANY variant is.
+        "variant_id": 56834319155587,
+    },
+]
 
-# The exact colour variant to watch. This is the "?variant=..." number in the
-# URL you gave (Warm Pebble). Set to None to alert if ANY variant is in stock.
-TARGET_VARIANT_ID = 56834319155587
+BASE_URL = "https://www.meaco.com/products/"
 
 # Where the "already alerted" memory is stored.
 # On GitHub Actions this is set to a file the workflow caches between runs.
 STATE_FILE = os.path.expanduser(
-    os.environ.get("MEACO_STATE_FILE", "~/.meaco_arete_seen.json")
+    os.environ.get("MEACO_STATE_FILE", "~/.meaco_dehumidifier_seen.json")
 )
 REQUEST_TIMEOUT_SECONDS = 20
+
+# Alerting behaviour (identical to the air-conditioner script):
+# - the very first time stock is found: send FIRST_TIME_ALERT_COUNT alerts
+# - checks 2 up to ALERT_EVERY_TIME_LIMIT: one alert each
+# - after that, send REPEAT_ALERT_COUNT alerts on every run while it stays in stock
+# - if a product goes out of stock, its memory is cleared so a later restock
+#   starts the count again from zero.
+FIRST_TIME_ALERT_COUNT = 3
+ALERT_EVERY_TIME_LIMIT = 5
+REPEAT_ALERT_COUNT = 2
 
 
 # -----------------------------
@@ -97,13 +123,13 @@ def clean_text(html):
     return text.lower().strip()
 
 
-def check_via_shopify_json():
+def check_via_shopify_json(handle, variant_id=None):
     """
     Preferred method: ask Shopify for the product JSON and read the exact
-    per-variant availability. Returns (status, reason) or None if it couldn't
-    be used (so we can fall back to HTML).
+    availability. Returns (status, reason) or None if it couldn't be used
+    (so we can fall back to HTML).
     """
-    html, error = fetch_url(PRODUCT_URL + ".js")
+    html, error = fetch_url(BASE_URL + handle + ".js")
     if error or not html:
         return None
 
@@ -113,40 +139,38 @@ def check_via_shopify_json():
         return None
 
     variants = data.get("variants") or []
-    if not variants:
-        return None
 
-    if TARGET_VARIANT_ID is not None:
+    # If a specific colour variant is requested, read only that one.
+    if variant_id is not None:
         target = next(
-            (v for v in variants if str(v.get("id")) == str(TARGET_VARIANT_ID)),
+            (v for v in variants if str(v.get("id")) == str(variant_id)),
             None,
         )
         if target is None:
-            # Variant id no longer exists (product may have changed).
             return "UNKNOWN", "target variant id not found in product JSON"
         colour = target.get("title", "variant")
         if target.get("available"):
             return "IN_STOCK", f"Shopify reports '{colour}' available"
         return "OUT_OF_STOCK", f"Shopify reports '{colour}' not available"
 
-    # No specific variant: in stock if ANY variant is available.
-    available = [v.get("title", "variant") for v in variants if v.get("available")]
-    if available:
-        return "IN_STOCK", "Shopify reports available: " + ", ".join(available)
-    return "OUT_OF_STOCK", "Shopify reports all variants unavailable"
+    # Otherwise: in stock if the product, or any variant, is available.
+    product_available = bool(data.get("available"))
+    any_variant_available = any(v.get("available") for v in variants)
+    if product_available or any_variant_available:
+        return "IN_STOCK", "Shopify reports available"
+    return "OUT_OF_STOCK", "Shopify reports not available"
 
 
-def check_via_html():
+def check_via_html(handle):
     """
     Fallback method: read the product page and use schema.org availability,
-    which is more reliable than the visible button text on this page.
+    which is more reliable than the visible button text on these pages.
     """
-    html, error = fetch_url(PRODUCT_URL)
+    html, error = fetch_url(BASE_URL + handle)
     if error or not html:
         return "UNKNOWN", f"could not fetch product page ({error or 'empty'})"
 
     lower = html.lower()
-
     if "schema.org/instock" in lower:
         return "IN_STOCK", "schema.org says InStock"
     if any(x in lower for x in ("schema.org/outofstock", "schema.org/soldout")):
@@ -155,10 +179,22 @@ def check_via_html():
     text = clean_text(html)
     if "out of stock" in text or "sold out" in text:
         return "OUT_OF_STOCK", "page shows out-of-stock wording"
-    if "add to cart" in text or "add to basket" in text:
-        return "POSSIBLE_IN_STOCK", "page shows an add-to-cart button"
+    if (
+        "add to cart" in text
+        or "add to basket" in text
+        or "buy now" in text
+    ):
+        return "POSSIBLE_IN_STOCK", "page shows an add-to-cart / buy-now button"
 
     return "UNKNOWN", "could not determine stock from page"
+
+
+def assess_product(handle, variant_id=None):
+    result = check_via_shopify_json(handle, variant_id)
+    if result is not None:
+        return result[0], result[1], "Shopify JSON"
+    status, reason = check_via_html(handle)
+    return status, reason, "HTML fallback"
 
 
 def phone_notify(title, message, click_url=None):
@@ -206,6 +242,12 @@ def open_in_browser(url):
         pass
 
 
+def send_alert(title, message, url):
+    """Fires one alert (phone push + Mac notification)."""
+    mac_notify(title, message)
+    phone_notify(title, message, click_url=url)
+
+
 # -----------------------------
 # Main check
 # -----------------------------
@@ -214,48 +256,69 @@ def main():
     seen = load_seen()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    watch_url = PRODUCT_URL
-    if TARGET_VARIANT_ID is not None:
-        watch_url = f"{PRODUCT_URL}?variant={TARGET_VARIANT_ID}"
-
-    print(f"\nMeaco Arete stock check: {now}")
-    print(f"Watching: {PRODUCT_NAME}")
-    print(f"  {watch_url}")
+    print(f"\nMeaco dehumidifier stock check: {now}")
     print("-" * 70)
 
-    result = check_via_shopify_json()
-    method = "Shopify JSON"
-    if result is None:
-        result = check_via_html()
-        method = "HTML fallback"
+    any_in_stock = False
 
-    status, reason = result
-    print(f"[{status}] ({method}) {reason}")
+    for product in PRODUCTS:
+        name = product["name"]
+        handle = product["handle"]
+        variant_id = product.get("variant_id")
 
-    in_stock = status in ("IN_STOCK", "POSSIBLE_IN_STOCK")
+        url = BASE_URL + handle
+        if variant_id is not None:
+            url = f"{url}?variant={variant_id}"
 
-    if not in_stock:
-        print("\nNot in stock yet.")
-        return
+        status, reason, method = assess_product(handle, variant_id)
+        print(f"[{status}] ({method}) {name} - {reason}")
+        print(f"  {url}")
 
-    print("\nIN STOCK!")
+        in_stock = status in ("IN_STOCK", "POSSIBLE_IN_STOCK")
 
-    # Only notify once per status until it changes.
-    seen_key = f"{PRODUCT_HANDLE}|{TARGET_VARIANT_ID}|{status}"
-    if not seen.get(seen_key):
-        seen[seen_key] = {"first_seen": now, "status": status, "reason": reason}
+        if in_stock:
+            any_in_stock = True
 
-        title = "Meaco Arete One 6L in stock!"
-        message = f"{PRODUCT_NAME} is available. Buy now.\n{watch_url}"
-        mac_notify(title, message)
-        phone_notify(title, message, click_url=watch_url)
-        open_in_browser(watch_url)
+            # Count how many consecutive checks this product has been in stock.
+            record = seen.get(url) or {"count": 0}
+            record["count"] = record.get("count", 0) + 1
+            record["status"] = status
+            record["last_seen"] = now
+            seen[url] = record
+            count = record["count"]
+
+            # First time: several alerts. Next few checks: one each.
+            # After that: repeat every run.
+            if count == 1:
+                n_alerts = FIRST_TIME_ALERT_COUNT
+            elif count <= ALERT_EVERY_TIME_LIMIT:
+                n_alerts = 1
+            else:
+                n_alerts = REPEAT_ALERT_COUNT
+
+            title = "MeacoDry Arete One 6L in stock!"
+            message = f"{name} is available. Buy now.\n{url}"
+            for _ in range(n_alerts):
+                send_alert(title, message, url)
+            open_in_browser(url)  # open the page once, not once per alert
+
+            print(f"  -> in stock for {count} check(s); sent {n_alerts} alert(s)")
+
+        elif status == "OUT_OF_STOCK":
+            # Went out of stock: clear its memory so a future restock alerts
+            # again from the very first check.
+            if url in seen:
+                del seen[url]
+                print("  -> was previously in stock; memory cleared")
+        # UNKNOWN status: leave memory untouched and don't alert.
+
+    print("-" * 70)
+    if not any_in_stock:
+        print("No in-stock Meaco dehumidifier found.")
 
     save_seen(seen)
 
 
 if __name__ == "__main__":
     main()
-
- 
 
